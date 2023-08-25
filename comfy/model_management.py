@@ -302,16 +302,15 @@ def unload_model_clones(model):
 def free_memory(memory_required, device, keep_loaded=[]):
     unloaded_model = False
     for i in range(len(current_loaded_models) -1, -1, -1):
-        if DISABLE_SMART_MEMORY:
-            current_free_mem = 0
-        else:
-            current_free_mem = get_free_memory(device)
-        if current_free_mem > memory_required:
-            break
+        if not DISABLE_SMART_MEMORY:
+            if get_free_memory(device) > memory_required:
+                break
         shift_model = current_loaded_models[i]
         if shift_model.device == device:
             if shift_model not in keep_loaded:
-                current_loaded_models.pop(i).model_unload()
+                m = current_loaded_models.pop(i)
+                m.model_unload()
+                del m
                 unloaded_model = True
 
     if unloaded_model:
@@ -394,6 +393,12 @@ def cleanup_models():
         x.model_unload()
         del x
 
+def dtype_size(dtype):
+    dtype_size = 4
+    if dtype == torch.float16 or dtype == torch.bfloat16:
+        dtype_size = 2
+    return dtype_size
+
 def unet_offload_device():
     if vram_state == VRAMState.HIGH_VRAM:
         return get_torch_device()
@@ -409,11 +414,7 @@ def unet_inital_load_device(parameters, dtype):
     if DISABLE_SMART_MEMORY:
         return cpu_dev
 
-    dtype_size = 4
-    if dtype == torch.float16 or dtype == torch.bfloat16:
-        dtype_size = 2
-
-    model_size = dtype_size * parameters
+    model_size = dtype_size(dtype) * parameters
 
     mem_dev = get_free_memory(torch_dev)
     mem_cpu = get_free_memory(cpu_dev)
@@ -432,8 +433,7 @@ def text_encoder_device():
     if args.gpu_only:
         return get_torch_device()
     elif vram_state == VRAMState.HIGH_VRAM or vram_state == VRAMState.NORMAL_VRAM:
-        #NOTE: on a Ryzen 5 7600X with 4080 it's faster to shift to GPU
-        if torch.get_num_threads() < 8: #leaving the text encoder on the CPU is faster than shifting it if the CPU is fast enough.
+        if should_use_fp16(prioritize_performance=False):
             return get_torch_device()
         else:
             return torch.device("cpu")
@@ -569,15 +569,19 @@ def is_device_mps(device):
             return True
     return False
 
-def should_use_fp16(device=None, model_params=0):
+def should_use_fp16(device=None, model_params=0, prioritize_performance=True):
     global xpu_available
     global directml_enabled
+
+    if device is not None:
+        if is_device_cpu(device):
+            return False
 
     if FORCE_FP16:
         return True
 
     if device is not None: #TODO
-        if is_device_cpu(device) or is_device_mps(device):
+        if is_device_mps(device):
             return False
 
     if FORCE_FP32:
@@ -610,7 +614,7 @@ def should_use_fp16(device=None, model_params=0):
 
     if fp16_works:
         free_model_memory = (get_free_memory() * 0.9 - minimum_inference_memory())
-        if model_params * 4 > free_model_memory:
+        if (not prioritize_performance) or model_params * 4 > free_model_memory:
             return True
 
     if props.major < 7:
